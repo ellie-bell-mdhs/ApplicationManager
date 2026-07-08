@@ -1,54 +1,24 @@
 import Foundation
 
 enum MenuBarAppsDiscovery {
-    private static let folderName = "Menu Bar Applications"
-    private static let maxSearchDepth = 5
+    private static let maxSearchDepth = 8
 
+    /// The folder to scan for menu bar apps, derived from where this app lives:
+    /// the directory containing the app bundle, or — when the bundle sits in a
+    /// project's `build` folder (e.g. `<parent>/<project>/build/App.app`) —
+    /// the parent that holds the sibling app projects.
     static func menuBarApplicationsFolder() -> URL? {
         var url = Bundle.main.bundleURL.deletingLastPathComponent()
-        for _ in 0..<8 {
-            if url.lastPathComponent == folderName {
-                return url
-            }
-            let parent = url.deletingLastPathComponent()
-            if parent.path == url.path {
-                break
-            }
-            url = parent
+        if url.lastPathComponent == "build" {
+            url = url.deletingLastPathComponent().deletingLastPathComponent()
         }
 
-        if let parent = parentOfContainingProject() {
-            return parent
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            return nil
         }
-
-        let fallback = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Projects/\(folderName)", isDirectory: true)
-        if FileManager.default.fileExists(atPath: fallback.path) {
-            return fallback
-        }
-
-        return nil
-    }
-
-    /// Parent of the project folder that contains this app (e.g. `ApplicationManager/build` → `Menu Bar Applications`).
-    private static func parentOfContainingProject() -> URL? {
-        var url = Bundle.main.bundleURL.deletingLastPathComponent()
-        for _ in 0..<8 {
-            if url.lastPathComponent == "build" {
-                let projectFolder = url.deletingLastPathComponent()
-                let parent = projectFolder.deletingLastPathComponent()
-                if parent.path != projectFolder.path {
-                    return parent
-                }
-            }
-
-            let parent = url.deletingLastPathComponent()
-            if parent.path == url.path {
-                break
-            }
-            url = parent
-        }
-        return nil
+        return url
     }
 
     static func discoverApps() -> [LibraryApp] {
@@ -57,46 +27,12 @@ enum MenuBarAppsDiscovery {
         let selfBundleID = Bundle.main.bundleIdentifier
         let selfAppName = Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String
 
-        var bundleURLs: [URL] = []
-        bundleURLs.append(contentsOf: immediateAppBundles(in: menuBarFolder))
-
-        for projectFolder in immediateSubfolders(in: menuBarFolder) {
-            bundleURLs.append(contentsOf: findAppBundles(in: projectFolder, remainingDepth: maxSearchDepth))
-        }
+        let bundleURLs = findAppBundles(in: menuBarFolder, remainingDepth: maxSearchDepth)
 
         let discovered = bundleURLs.compactMap { url in
             makeLibraryApp(from: url, selfBundleID: selfBundleID, selfAppName: selfAppName)
         }
         return deduplicated(discovered)
-    }
-
-    private static func immediateAppBundles(in directory: URL) -> [URL] {
-        guard let contents = try? FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return []
-        }
-
-        return contents.filter { $0.pathExtension == "app" }
-    }
-
-    private static func immediateSubfolders(in directory: URL) -> [URL] {
-        guard let contents = try? FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return []
-        }
-
-        return contents.filter { url in
-            guard url.pathExtension != "app" else { return false }
-            guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return false }
-            let name = url.lastPathComponent
-            return name != ".git" && !name.hasPrefix(".")
-        }
     }
 
     private static func findAppBundles(in directory: URL, remainingDepth: Int) -> [URL] {
@@ -111,8 +47,8 @@ enum MenuBarAppsDiscovery {
 
         var apps: [URL] = []
         for item in contents {
-            if item.pathExtension == "app" {
-                apps.append(item)
+            if let appURL = resolvedAppBundleURL(from: item) {
+                apps.append(appURL)
                 continue
             }
 
@@ -127,6 +63,29 @@ enum MenuBarAppsDiscovery {
         }
 
         return apps
+    }
+
+    /// Resolves `.app` bundles, symlinks, and Finder aliases to a launchable app URL.
+    private static func resolvedAppBundleURL(from url: URL) -> URL? {
+        if url.pathExtension == "app" {
+            return Bundle(url: url) != nil ? url : nil
+        }
+
+        if let aliasTarget = try? URL(resolvingAliasFileAt: url, options: [.withoutUI]),
+           aliasTarget.pathExtension == "app",
+           Bundle(url: aliasTarget) != nil {
+            return aliasTarget
+        }
+
+        let resolvedPath = (url.path as NSString).resolvingSymlinksInPath
+        if resolvedPath != url.path {
+            let resolvedURL = URL(fileURLWithPath: resolvedPath)
+            if resolvedURL.pathExtension == "app", Bundle(url: resolvedURL) != nil {
+                return resolvedURL
+            }
+        }
+
+        return nil
     }
 
     private static func makeLibraryApp(
