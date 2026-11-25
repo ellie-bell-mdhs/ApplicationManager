@@ -1,8 +1,10 @@
 import AppKit
+import Darwin
 import UniformTypeIdentifiers
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem?
+    private var addAppMenu: NSMenu?
     private var config = LibraryConfig(apps: [])
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -16,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             button.toolTip = "Application Manager"
         }
         statusItem = item
+        MenuBarAppCandidates.warmUpInBackground()
     }
 
     @objc private func statusItemClicked(_ sender: Any?) {
@@ -49,11 +52,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let manageItem = NSMenuItem(title: "Manage Library", action: nil, keyEquivalent: "")
         let manageMenu = NSMenu()
 
-        manageMenu.addItem(
-            withTitle: "Add Application",
-            action: #selector(addApplication),
-            keyEquivalent: ""
-        ).target = self
+        // Filled in menuNeedsUpdate, only when opened: finding running menu bar apps
+        // takes a fraction of a second, too slow to do on every click of the icon.
+        let addMenu = NSMenu()
+        addMenu.delegate = self
+        addMenu.autoenablesItems = false
+        addAppMenu = addMenu
+        let addItem = NSMenuItem(title: "Add Application", action: nil, keyEquivalent: "")
+        addItem.submenu = addMenu
+        manageMenu.addItem(addItem)
 
         manageMenu.addItem(
             withTitle: "Refresh Library",
@@ -86,7 +93,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             keyEquivalent: "q"
         ).target = self
 
-        menu.popUp(positioning: nil, at: NSPoint(x: button.bounds.midX, y: button.bounds.height), in: button)
+        // Attaching the menu and clicking lets macOS place it under the icon;
+        // a manual popUp(at:) lands in the wrong spot on some menu bar layouts.
+        statusItem?.menu = menu
+        button.performClick(nil)
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        // Detach so the next click reaches statusItemClicked and rebuilds the menu.
+        guard menu === statusItem?.menu else { return }
+        statusItem?.menu = nil
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === addAppMenu else { return }
+        menu.removeAllItems()
+
+        let candidates = MenuBarAppCandidates.candidates(excluding: config.apps)
+        if candidates.isEmpty {
+            let noneItem = NSMenuItem(title: "No other menu bar apps found", action: nil, keyEquivalent: "")
+            noneItem.isEnabled = false
+            menu.addItem(noneItem)
+        }
+        for candidate in candidates {
+            let item = NSMenuItem(
+                title: candidate.isRunning ? "\(candidate.name)  ✓" : candidate.name,
+                action: #selector(addCandidate(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = candidate.url
+            item.image = AppBundleIcon.menuIcon(for: candidate.url)
+            item.toolTip = candidate.url.path
+            menu.addItem(item)
+        }
+
+        if !MenuBarAppCandidates.canSeeRunningApps {
+            menu.addItem(.separator())
+            let allowItem = NSMenuItem(
+                title: "Allow Accessibility to Find Running Apps…",
+                action: #selector(requestAccessibility),
+                keyEquivalent: ""
+            )
+            allowItem.target = self
+            allowItem.toolTip = "Without it, only installed menu bar-only apps are listed."
+            menu.addItem(allowItem)
+        }
+
+        menu.addItem(.separator())
+        menu.addItem(
+            withTitle: "Choose Other Application…",
+            action: #selector(chooseOtherApplication),
+            keyEquivalent: ""
+        ).target = self
     }
 
     private func makeAppMenuItem(for app: LibraryApp) -> NSMenuItem {
@@ -124,8 +183,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        if let runningApp = runningApplication(for: app) {
-            runningApp.terminate()
+        let runningApps = runningApplications(for: app)
+        if !runningApps.isEmpty {
+            quitApplications(runningApps)
             return
         }
 
@@ -137,10 +197,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        let configuration = NSWorkspace.OpenConfiguration()
-        configuration.activates = true
+        launchInMenuBar(app)
+    }
 
-        NSWorkspace.shared.openApplication(at: app.url, configuration: configuration) { _, error in
+    /// Start in the background with windows hidden, so apps that also open a
+    /// main window (e.g. Wispr Flow) come up in the menu bar only.
+    private func launchInMenuBar(_ app: LibraryApp) {
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = false
+        configuration.hides = true
+
+        NSWorkspace.shared.openApplication(at: app.url, configuration: configuration) { runningApp, error in
+            if let runningApp {
+                DispatchQueue.main.async { self.keepHiddenWhileStarting(runningApp) }
+            }
             if let error {
                 DispatchQueue.main.async {
                     self.showAlert(
@@ -152,7 +222,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc private func addApplication() {
+    /// Some apps (e.g. Wispr Flow) ignore the hidden-launch request: they show their
+    /// main window and bring themselves to the front once loaded. Keep hiding them
+    /// while they start. Wispr Flow (with "Hide app in Dock" on) drops its Dock icon
+    /// once its window is hidden; at that point un-hide it so its dictation bar can
+    /// still appear. Menu bar-only apps are skipped.
+    private func keepHiddenWhileStarting(_ runningApp: NSRunningApplication, checksLeft: Int = 30) {
+        guard checksLeft > 0, !runningApp.isTerminated else { return }
+
+        if runningApp.activationPolicy == .accessory {
+            if runningApp.isHidden { runningApp.unhide() }
+            return
+        }
+        if runningApp.activationPolicy == .regular, !runningApp.isHidden {
+            runningApp.hide()
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            self.keepHiddenWhileStarting(runningApp, checksLeft: checksLeft - 1)
+        }
+    }
+
+    /// Adds a menu bar app picked from the list and turns it on.
+    @objc private func addCandidate(_ sender: NSMenuItem) {
+        guard let url = sender.representedObject as? URL else { return }
+        let entry = addToLibrary(url)
+        if !isRunning(entry) {
+            launchInMenuBar(entry)
+        }
+    }
+
+    @objc private func requestAccessibility() {
+        MenuBarAppCandidates.requestAccessibilityPermission()
+    }
+
+    @objc private func chooseOtherApplication() {
         let panel = NSOpenPanel()
         panel.title = "Add Application"
         panel.message = "Choose an app to add to your library."
@@ -163,6 +267,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
+        addToLibrary(url)
+        showMenu()
+    }
+
+    @discardableResult
+    private func addToLibrary(_ url: URL) -> LibraryApp {
         let bundle = Bundle(url: url)
         let name = bundle?.object(forInfoDictionaryKey: "CFBundleName") as? String
             ?? url.deletingPathExtension().lastPathComponent
@@ -187,7 +297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         config.apps.append(entry)
         LibraryStore.save(config)
         reloadLibrary()
-        showMenu()
+        return entry
     }
 
     @objc private func removeApplication(_ sender: NSMenuItem) {
@@ -209,21 +319,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func isRunning(_ app: LibraryApp) -> Bool {
-        runningApplication(for: app) != nil
+        !runningApplications(for: app).isEmpty
     }
 
-    private func runningApplication(for app: LibraryApp) -> NSRunningApplication? {
-        if let bundleID = app.resolvedBundleIdentifier {
-            if let match = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundleID }) {
-                return match
+    private func runningApplications(for app: LibraryApp) -> [NSRunningApplication] {
+        var matchedPIDs = Set<pid_t>()
+        var matches: [NSRunningApplication] = []
+
+        for runningApp in NSWorkspace.shared.runningApplications {
+            guard isUserOwnedProcess(runningApp) else { continue }
+
+            if belongs(runningApp, to: app),
+               matchedPIDs.insert(runningApp.processIdentifier).inserted {
+                matches.append(runningApp)
             }
         }
 
-        let appName = app.url.deletingPathExtension().lastPathComponent
-        return NSWorkspace.shared.runningApplications.first { runningApp in
-            runningApp.bundleURL?.path == app.url.path
-                || runningApp.localizedName == app.name
-                || runningApp.localizedName == appName
+        return matches
+    }
+
+    /// The app itself, or one of its own helper processes (e.g. Wispr Flow's
+    /// `com.electron.wispr-flow.helper`). Only the app's full ID or bundle path count:
+    /// apps from the same developer share an ID prefix (`com.megadata.claudeping` and
+    /// `com.megadata.claudespeech`), and turning one off must not quit the other.
+    private func belongs(_ runningApp: NSRunningApplication, to app: LibraryApp) -> Bool {
+        if let bundleID = app.resolvedBundleIdentifier, let runningBundleID = runningApp.bundleIdentifier,
+           runningBundleID == bundleID || runningBundleID.hasPrefix(bundleID + ".") {
+            return true
+        }
+
+        if let runningPath = runningApp.bundleURL?.path,
+           runningPath == app.url.path || runningPath.hasPrefix(app.url.path + "/") {
+            return true
+        }
+
+        let appFolderName = app.url.deletingPathExtension().lastPathComponent
+        return runningApp.localizedName == app.name || runningApp.localizedName == appFolderName
+    }
+
+    private func isUserOwnedProcess(_ runningApp: NSRunningApplication) -> Bool {
+        let pid = runningApp.processIdentifier
+        guard pid > 0 else { return false }
+
+        var info = proc_bsdinfo()
+        let expectedSize = MemoryLayout<proc_bsdinfo>.size
+        let size = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, Int32(expectedSize))
+        guard size == expectedSize else { return false }
+        return info.pbi_uid == getuid()
+    }
+
+    private func quitApplications(_ apps: [NSRunningApplication]) {
+        for app in apps {
+            _ = app.terminate()
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            for app in apps where !app.isTerminated {
+                app.forceTerminate()
+            }
         }
     }
 

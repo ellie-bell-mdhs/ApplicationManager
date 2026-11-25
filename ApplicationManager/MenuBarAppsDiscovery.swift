@@ -2,6 +2,9 @@ import Foundation
 
 enum MenuBarAppsDiscovery {
     private static let maxSearchDepth = 8
+    /// Xcode build caches hold thousands of folders but never a launchable app;
+    /// scanning them made every menu click take seconds.
+    private static let skippedFolderNames: Set<String> = ["Logs", "SourcePackages", "node_modules"]
 
     /// The folder to scan for menu bar apps, derived from where this app lives:
     /// the directory containing the app bundle, or — when the bundle sits in a
@@ -55,7 +58,7 @@ enum MenuBarAppsDiscovery {
             guard (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
 
             let name = item.lastPathComponent
-            if name == ".git" || name.hasPrefix(".") {
+            if name == ".git" || name.hasPrefix(".") || skippedFolderNames.contains(name) || name.hasSuffix(".noindex") {
                 continue
             }
 

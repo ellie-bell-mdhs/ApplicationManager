@@ -38,6 +38,7 @@ swiftc \
     "$SRC_DIR/AppBundleIcon.swift" \
     "$SRC_DIR/MenuBarSymbolDiscovery.swift" \
     "$SRC_DIR/MenuBarAppsDiscovery.swift" \
+    "$SRC_DIR/MenuBarAppCandidates.swift" \
     -framework AppKit
 
 cp "$SRC_DIR/Info.plist" "$CONTENTS_DIR/Info.plist"

@@ -80,6 +80,12 @@ enum LibraryStore {
     }
 
     private static func shouldPersistMergedChanges(from saved: LibraryConfig, to merged: LibraryConfig) -> Bool {
+        let savedKeys = Set(saved.apps.map { identityKey(for: $0) })
+        let mergedKeys = Set(merged.apps.map { identityKey(for: $0) })
+        if mergedKeys != savedKeys {
+            return true
+        }
+
         let savedPathsByKey = Dictionary(uniqueKeysWithValues: saved.apps.map { (identityKey(for: $0), $0.path) })
         for app in merged.apps {
             let key = identityKey(for: app)
